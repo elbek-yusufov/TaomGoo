@@ -1,0 +1,21 @@
+{
+  "short_name": "TaomGo",
+  "name": "TaomGo - POS & Restaurant Management",
+  "icons": [
+    {
+      "src": "https://images.unsplash.com/photo-1633964913295-ceb43826e7c9?w=192&h=192&auto=format&fit=crop&q=80",
+      "type": "image/jpeg",
+      "sizes": "192x192"
+    },
+    {
+      "src": "https://images.unsplash.com/photo-1633964913295-ceb43826e7c9?w=512&h=512&auto=format&fit=crop&q=80",
+      "type": "image/jpeg",
+      "sizes": "512x512"
+    }
+  ],
+  "start_url": "/",
+  "background_color": "#FFF8F0",
+  "theme_color": "#FF5A1F",
+  "display": "standalone",
+  "orientation": "any"
+}

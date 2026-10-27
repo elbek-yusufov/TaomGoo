@@ -1,0 +1,6 @@
+{
+  "name": "TaomGo - POS & Restaurant Management",
+  "description": "O'zbekiston kafelari va restoranlari uchun ko'p ijarachili POS va boshqaruv tizimi. Kassa, Oshxona, Stollar, Menyu, Ombor va AI Moliya tahlili.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
