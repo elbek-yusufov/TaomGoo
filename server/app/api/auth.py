@@ -1,5 +1,5 @@
 """
-Auth API — login, register, refresh, profile.
+Auth API — login, register, refresh, profile, and password management.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
@@ -11,6 +11,7 @@ from app.core.security import hash_password, verify_password, create_access_toke
 from app.core.deps import get_current_user
 from app.models.user import User
 from app.models.tenant import Tenant
+from app.models.audit import AuditLog
 from app.schemas.auth import (
     LoginRequest, RegisterRequest, TokenResponse, RefreshRequest,
     LoginResponse, UserProfileOut, TenantOut,
@@ -24,8 +25,9 @@ def _user_to_profile(user: User) -> UserProfileOut:
         user_id=user.id,
         username=user.username,
         full_name=user.full_name,
+        phone=user.phone,
         role=user.role,
-        tenant=TenantOut.model_validate(user.tenant),
+        tenant=TenantOut.model_validate(user.tenant) if user.tenant else None,
     )
 
 
@@ -49,31 +51,70 @@ async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
             detail="Foydalanuvchi bloklangan",
         )
 
+    # Check tenant status if not super_admin
+    if user.tenant and user.tenant.status == "suspended" and user.role != "super_admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Restoran faoliyati vaqtincha to'xtatilgan. Administratorga murojaat qiling.",
+        )
+
     tokens = TokenResponse(
         access=create_access_token({"sub": user.id, "role": user.role, "tenant": user.tenant_id}),
         refresh=create_refresh_token({"sub": user.id}),
     )
 
+    # Record audit log
+    audit = AuditLog(
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        user_name=user.full_name,
+        action="login",
+        resource_type="auth",
+        resource_id=user.id,
+        details=f"Foydalanuvchi {user.username} tizimga kirdi ({user.role})",
+    )
+    db.add(audit)
+    await db.commit()
+
     return LoginResponse(tokens=tokens, user=_user_to_profile(user))
+
+
+# Alias for JWT token endpoint
+@router.post("/token/", response_model=TokenResponse)
+async def login_for_access_token(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    """OAuth2/JWT token exchange endpoint."""
+    res = await login(body, db)
+    return res.tokens
 
 
 @router.post("/register/", response_model=UserProfileOut, status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    """Register a new user (admin only in production, open for demo)."""
+    """Register a new user or owner."""
+    # Prevent unauthorized super_admin registration
+    if body.role == "super_admin":
+        user_count = await db.scalar(select(User.id))
+        if user_count:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Super Admin ro'yxatdan o'tishi faqat tizim sozlashda ruxsat etiladi",
+            )
+
     # Check duplicate username
     existing = await db.execute(select(User).where(User.username == body.username))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=400, detail="Bu username allaqachon mavjud")
 
-    # Verify tenant exists
-    tenant_result = await db.execute(select(Tenant).where(Tenant.id == body.tenant_id))
-    tenant = tenant_result.scalar_one_or_none()
-    if not tenant:
-        raise HTTPException(status_code=404, detail="Tenant topilmadi")
+    # If tenant_id provided, verify tenant exists
+    if body.tenant_id:
+        tenant_result = await db.execute(select(Tenant).where(Tenant.id == body.tenant_id))
+        tenant = tenant_result.scalar_one_or_none()
+        if not tenant:
+            raise HTTPException(status_code=404, detail="Tenant topilmadi")
 
     user = User(
         username=body.username,
         full_name=body.full_name,
+        phone=body.phone,
         hashed_password=hash_password(body.password),
         role=body.role,
         tenant_id=body.tenant_id,

@@ -1,16 +1,20 @@
 """
-Finance / Dashboard API — aggregated statistics.
+Finance & Cash Register API — Aggregated statistics, cash shifts (smena), and refunds.
 """
+from typing import List, Optional
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select, func, case
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.deps import require_admin
+from app.core.deps import get_current_user, require_admin, require_cashier_or_admin
 from app.models.user import User
 from app.models.order import Order, OrderItem
 from app.models.inventory import Ingredient
+from app.models.cash_shift import CashShift
+from app.models.audit import AuditLog
 from app.schemas.finance import (
     FinanceSummaryOut, RevenueByPayment, RevenueByHour,
     TopSellingItem, WaiterStat,
@@ -19,6 +23,220 @@ from app.schemas.finance import (
 router = APIRouter(prefix="/finance", tags=["Finance"])
 
 
+# Schemas for Shifts
+class ShiftOpenRequest(BaseModel):
+    initial_cash: float
+    notes: Optional[str] = None
+
+
+class ShiftCloseRequest(BaseModel):
+    actual_cash: float
+    notes: Optional[str] = None
+
+
+class ShiftOut(BaseModel):
+    id: str
+    tenant_id: str
+    cashier_id: str
+    cashier_name: str
+    opened_at: datetime
+    closed_at: Optional[datetime] = None
+    is_open: bool
+    initial_cash: float
+    total_cash_sales: float
+    total_card_sales: float
+    total_debt_sales: float
+    expected_cash: float
+    actual_cash: Optional[float] = None
+    cash_difference: Optional[float] = None
+    notes: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RefundRequest(BaseModel):
+    order_id: str
+    reason: str
+
+
+# ── Cash Shifts (Smena) ──────────────────────────────────
+@router.get("/shifts/current/", response_model=Optional[ShiftOut])
+async def get_current_shift(
+    user: User = Depends(require_cashier_or_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Get active open shift for the current cashier or restaurant."""
+    query = select(CashShift).where(
+        CashShift.tenant_id == user.tenant_id,
+        CashShift.is_open == True,
+    )
+    if user.role == "cashier":
+        query = query.where(CashShift.cashier_id == user.id)
+    query = query.order_by(CashShift.opened_at.desc())
+    
+    result = await db.execute(query)
+    shift = result.scalars().first()
+    return shift
+
+
+@router.post("/shifts/open/", response_model=ShiftOut, status_code=status.HTTP_201_CREATED)
+async def open_shift(
+    body: ShiftOpenRequest,
+    user: User = Depends(require_cashier_or_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Open a new cashier shift with starting drawer cash."""
+    # Check if cashier already has an open shift
+    existing = await db.execute(
+        select(CashShift).where(
+            CashShift.tenant_id == user.tenant_id,
+            CashShift.cashier_id == user.id,
+            CashShift.is_open == True,
+        )
+    )
+    if existing.scalars().first():
+        raise HTTPException(status_code=400, detail="Sizda allaqachon ochiq smena mavjud")
+
+    shift = CashShift(
+        tenant_id=user.tenant_id,
+        cashier_id=user.id,
+        cashier_name=user.full_name,
+        initial_cash=body.initial_cash,
+        expected_cash=body.initial_cash,
+        notes=body.notes,
+        is_open=True,
+    )
+    db.add(shift)
+
+    audit = AuditLog(
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        user_name=user.full_name,
+        action="shift_opened",
+        resource_type="cash_shift",
+        resource_id=shift.id,
+        details=f"Smena ochildi. Boshlang'ich kassa: {body.initial_cash:,.0f} so'm",
+    )
+    db.add(audit)
+
+    await db.commit()
+    await db.refresh(shift)
+    return shift
+
+
+@router.post("/shifts/close/", response_model=ShiftOut)
+async def close_shift(
+    body: ShiftCloseRequest,
+    user: User = Depends(require_cashier_or_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Close active shift, calculate drawer difference and sales totals."""
+    query = select(CashShift).where(
+        CashShift.tenant_id == user.tenant_id,
+        CashShift.is_open == True,
+    )
+    if user.role == "cashier":
+        query = query.where(CashShift.cashier_id == user.id)
+    query = query.order_by(CashShift.opened_at.desc())
+
+    result = await db.execute(query)
+    shift = result.scalars().first()
+    if not shift:
+        raise HTTPException(status_code=404, detail="Yopish uchun faol smena topilmadi")
+
+    # Aggregate sales made during this shift
+    sales_query = await db.execute(
+        select(
+            Order.payment_type,
+            func.coalesce(func.sum(Order.total_price), 0).label("sum"),
+        )
+        .where(
+            Order.tenant_id == user.tenant_id,
+            Order.created_at >= shift.opened_at,
+            Order.status != "canceled",
+        )
+        .group_by(Order.payment_type)
+    )
+    sales = {r.payment_type: float(r.sum) for r in sales_query.all()}
+    shift.total_cash_sales = sales.get("cash", 0.0)
+    shift.total_card_sales = sales.get("card", 0.0)
+    shift.total_debt_sales = sales.get("debt", 0.0)
+
+    shift.expected_cash = shift.initial_cash + shift.total_cash_sales
+    shift.actual_cash = body.actual_cash
+    shift.cash_difference = body.actual_cash - shift.expected_cash
+    shift.is_open = False
+    shift.closed_at = datetime.now(timezone.utc)
+    if body.notes:
+        shift.notes = f"{shift.notes or ''} | Yopilish izohi: {body.notes}".strip(" |")
+
+    audit = AuditLog(
+        tenant_id=user.tenant_id,
+        user_id=user.id,
+        user_name=user.full_name,
+        action="shift_closed",
+        resource_type="cash_shift",
+        resource_id=shift.id,
+        details=f"Smena yopildi. Farq: {shift.cash_difference:,.0f} so'm. Naqd tushum: {shift.total_cash_sales:,.0f}",
+    )
+    db.add(audit)
+
+    await db.commit()
+    await db.refresh(shift)
+    return shift
+
+
+@router.get("/shifts/", response_model=List[ShiftOut])
+async def list_shifts(
+    user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """List historical shifts for the restaurant."""
+    result = await db.execute(
+        select(CashShift)
+        .where(CashShift.tenant_id == user.tenant_id)
+        .order_by(CashShift.opened_at.desc())
+        .limit(50)
+    )
+    return result.scalars().all()
+
+
+# ── Refund Operation ──────────────────────────────────────
+@router.post("/refund/")
+async def refund_order(
+    body: RefundRequest,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Process an authorized refund for an order."""
+    order = await db.get(Order, body.order_id)
+    if not order or order.tenant_id != admin.tenant_id:
+        raise HTTPException(status_code=404, detail="Buyurtma topilmadi")
+
+    if order.status == "canceled":
+        raise HTTPException(status_code=400, detail="Buyurtma allaqachon bekor qilingan")
+
+    order.payment_status = "refunded"
+    order.status = "canceled"
+    order.status_display = "Qaytarildi (Refund)"
+
+    audit = AuditLog(
+        tenant_id=admin.tenant_id,
+        user_id=admin.id,
+        user_name=admin.full_name,
+        action="order_refunded",
+        resource_type="order",
+        resource_id=order.id,
+        details=f"Buyurtma #{order.order_number} uchun refund qilindi ({order.total_price:,.0f} so'm). Sabab: {body.reason}",
+    )
+    db.add(audit)
+    await db.commit()
+
+    return {"message": "To'lov muvaffaqiyatli qaytarildi", "order_id": order.id, "refund_amount": order.total_price}
+
+
+# ── Summary / Reports ─────────────────────────────────────
 @router.get("/summary/", response_model=FinanceSummaryOut)
 async def get_finance_summary(
     date: str | None = None,
@@ -34,14 +252,12 @@ async def get_finance_summary(
     start = datetime.combine(target_date, datetime.min.time()).replace(tzinfo=timezone.utc)
     end = start + timedelta(days=1)
 
-    # Base query: orders for tenant on target date
     base_filter = [
         Order.tenant_id == user.tenant_id,
         Order.created_at >= start,
         Order.created_at < end,
     ]
 
-    # Total orders & revenue
     totals = await db.execute(
         select(
             func.count(Order.id).label("total_orders"),
@@ -52,9 +268,8 @@ async def get_finance_summary(
     row = totals.one()
     total_orders = row.total_orders
     total_revenue = float(row.total_revenue)
-    total_canceled = int(row.total_canceled)
+    total_canceled = int(row.total_canceled or 0)
 
-    # Revenue by payment type
     payment_result = await db.execute(
         select(
             Order.payment_type,
@@ -68,7 +283,6 @@ async def get_finance_summary(
         if pr.payment_type in payment_map:
             payment_map[pr.payment_type] = float(pr.amount)
 
-    # Revenue by hour
     hour_result = await db.execute(
         select(
             func.extract("hour", Order.created_at).label("hour"),
@@ -83,7 +297,6 @@ async def get_finance_summary(
         for h in hour_result.all()
     ]
 
-    # Top selling items
     top_result = await db.execute(
         select(
             OrderItem.food_name,
@@ -101,7 +314,6 @@ async def get_finance_summary(
         for t in top_result.all()
     ]
 
-    # Waiter stats
     waiter_result = await db.execute(
         select(
             Order.waiter_name,
@@ -123,14 +335,12 @@ async def get_finance_summary(
         for w in waiter_result.all()
     ]
 
-    # Low stock count
     low_stock = await db.execute(
         select(func.count(Ingredient.id))
         .where(Ingredient.tenant_id == user.tenant_id, Ingredient.stock_quantity <= Ingredient.min_limit)
     )
     low_stock_count = low_stock.scalar() or 0
 
-    # Net profit estimate (revenue - cost would require COGS, for now = revenue * 0.65)
     net_profit = total_revenue * 0.65
 
     return FinanceSummaryOut(

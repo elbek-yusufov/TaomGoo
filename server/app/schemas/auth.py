@@ -14,8 +14,9 @@ class RegisterRequest(BaseModel):
     username: str
     password: str
     full_name: str
+    phone: Optional[str] = None
     role: str = "cashier"
-    tenant_id: str
+    tenant_id: Optional[str] = None
 
 
 class TokenResponse(BaseModel):
@@ -32,7 +33,9 @@ class TenantOut(BaseModel):
     name: str
     address: Optional[str] = None
     phone: Optional[str] = None
-    currency: Optional[str] = "UZS"
+    currency: Optional[str] = "so'm"
+    status: Optional[str] = "active"
+    subscription_plan: Optional[str] = "pro"
 
     class Config:
         from_attributes = True
@@ -42,8 +45,9 @@ class UserProfileOut(BaseModel):
     user_id: str
     username: str
     full_name: str
+    phone: Optional[str] = None
     role: str
-    tenant: TenantOut
+    tenant: Optional[TenantOut] = None
 
     class Config:
         from_attributes = True

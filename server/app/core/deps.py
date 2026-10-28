@@ -1,5 +1,5 @@
 """
-FastAPI dependencies: current user extraction, role-based access control.
+FastAPI dependencies: current user extraction, role-based access control, tenant extraction.
 """
 from typing import List, Optional
 
@@ -14,7 +14,7 @@ from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.user import User
 
-bearer_scheme = HTTPBearer()
+bearer_scheme = HTTPBearer(auto_error=True)
 
 
 async def get_current_user(
@@ -54,13 +54,16 @@ class RoleChecker:
         if user.role not in self.allowed_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Bu amaliyotga ruxsatingiz yo'q",
+                detail=f"Bu amaliyotga ruxsatingiz yo'q (talab qilinadigan rollar: {', '.join(self.allowed_roles)})",
             )
         return user
 
 
-# Convenience role checkers
-require_admin = RoleChecker(["admin"])
-require_cashier_or_admin = RoleChecker(["cashier", "admin"])
-require_chef_or_admin = RoleChecker(["chef", "admin"])
-require_any_role = RoleChecker(["admin", "cashier", "chef"])
+# Role checkers
+require_super_admin = RoleChecker(["super_admin"])
+require_admin = RoleChecker(["super_admin", "admin"])
+require_cashier_or_admin = RoleChecker(["super_admin", "admin", "cashier"])
+require_waiter_or_admin = RoleChecker(["super_admin", "admin", "cashier", "waiter"])
+require_chef_or_admin = RoleChecker(["super_admin", "admin", "chef"])
+require_courier_or_admin = RoleChecker(["super_admin", "admin", "courier"])
+require_any_role = RoleChecker(["super_admin", "admin", "cashier", "chef", "waiter", "courier", "manager"])
